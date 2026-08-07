@@ -1,0 +1,4 @@
+.zed/
+.zpkg.lock
+/target
+Cargo.lock

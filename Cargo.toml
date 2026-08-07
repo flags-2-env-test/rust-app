@@ -1,0 +1,16 @@
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+description = "Rust consumer of oresoftware/flags-2-env."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+# The one dependency sourced through zed: a cargo path dep pointing into the
+# directory .zpkg.toml's [install].dir names. crates.io deps would sit here too.
+[dependencies]
+flags2env = { path = ".vendor/.zed/oresoftware/flags-2-env/clients/rust" }
