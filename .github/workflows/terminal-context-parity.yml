@@ -1,0 +1,285 @@
+name: terminal context parity with zed
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/terminal-context-parity.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: den-3164-terminal-context-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  FLAGS_REF: 2f67649c65d2167037e0346eb4cde865d131cce8
+  ZED_REF: 5d1d13119be5784f545a7d812cdfaae3ca120693
+  RUST_TOOLCHAIN: 1.97.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  parity:
+    name: Shared context vocabulary / ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: Linux
+          - os: macos-15
+            label: macOS
+          - os: windows-2025
+            label: Windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out fixture without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fixture
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Check out exact flags2env source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ORESoftware/flags-2-env
+          ref: ${{ env.FLAGS_REF }}
+          path: flags
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Check out exact Zed source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zed-pkg/zed-cli
+          ref: ${{ env.ZED_REF }}
+          path: zed
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+
+      - name: Verify immutable inputs
+        run: |
+          set -euo pipefail
+          test "$(git -C flags rev-parse HEAD)" = "$FLAGS_REF"
+          test "$(git -C zed rev-parse HEAD)" = "$ZED_REF"
+          test -f flags/src/terminal_context.c
+          test -f flags/src/terminal_context.h
+          test -f zed/src/terminal_context.rs
+
+      - name: Install fixed Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Build exact Zed CLI
+        working-directory: zed
+        run: cargo build --release --locked --bin zed
+
+      - name: Compile a strict C ABI probe
+        run: |
+          set -euo pipefail
+          cat > f2e_probe.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include "terminal_context.h"
+
+          int main(void) {
+            char *semantic = f2e_terminal_context_json();
+            char *env_map = f2e_terminal_context_env_json();
+            if (!semantic || !env_map) {
+              free(semantic);
+              free(env_map);
+              return 2;
+            }
+            puts(semantic);
+            puts(env_map);
+            free(semantic);
+            free(env_map);
+            return 0;
+          }
+          EOF
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            compiler=clang
+            suffix=.exe
+          else
+            compiler=cc
+            suffix=
+          fi
+          "$compiler" -std=c99 -Wall -Wextra -Wpedantic -O2 \
+            -Iflags/src flags/src/terminal_context.c f2e_probe.c \
+            -o "f2e-probe${suffix}"
+          test -x "f2e-probe${suffix}"
+
+      - name: Create semantic comparison probes
+        run: |
+          set -euo pipefail
+          cat > zed_probe.py <<'PY'
+          import json, os
+
+          def truth(name):
+              return os.environ[name].lower() == "true"
+
+          columns = int(os.environ["ZED_PKG_CONTEXT_COLUMNS"])
+          payload = {
+              "version": int(os.environ["ZED_PKG_CONTEXT_VERSION"]),
+              "stdinTty": truth("ZED_PKG_CONTEXT_STDIN_TTY"),
+              "stdoutTty": truth("ZED_PKG_CONTEXT_STDOUT_TTY"),
+              "stderrTty": truth("ZED_PKG_CONTEXT_STDERR_TTY"),
+              "interactive": truth("ZED_PKG_CONTEXT_INTERACTIVE"),
+              "canPrompt": truth("ZED_PKG_CONTEXT_CAN_PROMPT"),
+              "ci": truth("ZED_PKG_CONTEXT_CI"),
+              "dumb": truth("ZED_PKG_CONTEXT_DUMB"),
+              "nested": truth("ZED_PKG_CONTEXT_NESTED"),
+              "outputMode": os.environ["ZED_PKG_CONTEXT_OUTPUT_MODE"],
+              "shell": os.environ["ZED_PKG_CONTEXT_SHELL"],
+              "shellSource": os.environ["ZED_PKG_CONTEXT_SHELL_SOURCE"],
+              "terminal": os.environ["ZED_PKG_CONTEXT_TERMINAL"],
+              "colorStdout": truth("ZED_PKG_CONTEXT_COLOR_STDOUT"),
+              "colorStderr": truth("ZED_PKG_CONTEXT_COLOR_STDERR"),
+              "unicode": truth("ZED_PKG_CONTEXT_UNICODE"),
+              "hyperlinks": truth("ZED_PKG_CONTEXT_HYPERLINKS"),
+              "columns": columns if columns else None,
+          }
+          print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+          PY
+
+          cat > compare_context.py <<'PY'
+          import json, pathlib, sys
+
+          f2e_lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          if len(f2e_lines) != 2:
+              raise SystemExit(f"expected two flags2env JSON lines, got {len(f2e_lines)}")
+          f2e = json.loads(f2e_lines[0])
+          env_map = json.loads(f2e_lines[1])
+          zed = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          if f2e != zed:
+              print("flags2env:", json.dumps(f2e, indent=2, sort_keys=True))
+              print("zed:      ", json.dumps(zed, indent=2, sort_keys=True))
+              raise SystemExit("terminal-context semantic mismatch")
+
+          projected = {
+              "F2E_CONTEXT_VERSION": str(f2e["version"]),
+              "F2E_CONTEXT_STDIN_TTY": str(f2e["stdinTty"]).lower(),
+              "F2E_CONTEXT_STDOUT_TTY": str(f2e["stdoutTty"]).lower(),
+              "F2E_CONTEXT_STDERR_TTY": str(f2e["stderrTty"]).lower(),
+              "F2E_CONTEXT_INTERACTIVE": str(f2e["interactive"]).lower(),
+              "F2E_CONTEXT_CAN_PROMPT": str(f2e["canPrompt"]).lower(),
+              "F2E_CONTEXT_CI": str(f2e["ci"]).lower(),
+              "F2E_CONTEXT_DUMB": str(f2e["dumb"]).lower(),
+              "F2E_CONTEXT_NESTED": str(f2e["nested"]).lower(),
+              "F2E_CONTEXT_OUTPUT_MODE": f2e["outputMode"],
+              "F2E_CONTEXT_SHELL": f2e["shell"],
+              "F2E_CONTEXT_SHELL_SOURCE": f2e["shellSource"],
+              "F2E_CONTEXT_TERMINAL": f2e["terminal"],
+              "F2E_CONTEXT_COLOR_STDOUT": str(f2e["colorStdout"]).lower(),
+              "F2E_CONTEXT_COLOR_STDERR": str(f2e["colorStderr"]).lower(),
+              "F2E_CONTEXT_UNICODE": str(f2e["unicode"]).lower(),
+              "F2E_CONTEXT_HYPERLINKS": str(f2e["hyperlinks"]).lower(),
+              "F2E_CONTEXT_COLUMNS": str(f2e["columns"] or 0),
+          }
+          if env_map != projected:
+              print("env api:   ", json.dumps(env_map, indent=2, sort_keys=True))
+              print("projected: ", json.dumps(projected, indent=2, sort_keys=True))
+              raise SystemExit("flags2env environment-map projection mismatch")
+          PY
+
+      - name: Compare deterministic CI context
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            F2E="$GITHUB_WORKSPACE/f2e-probe.exe"
+            ZED="$GITHUB_WORKSPACE/zed/target/release/zed.exe"
+          else
+            F2E="$GITHUB_WORKSPACE/f2e-probe"
+            ZED="$GITHUB_WORKSPACE/zed/target/release/zed"
+          fi
+          PYTHON="$(command -v python3 || command -v python)"
+          env \
+            F2E_FORCE_STDIN_TTY=1 F2E_FORCE_STDOUT_TTY=1 F2E_FORCE_STDERR_TTY=1 \
+            F2E_FORCE_CI=1 F2E_FORCE_UNICODE=1 F2E_SHELL=bash \
+            TERM=xterm-256color COLUMNS=132 \
+            "$F2E" > f2e-ci.jsonl
+          env \
+            F2E_FORCE_STDIN_TTY=1 F2E_FORCE_STDOUT_TTY=1 F2E_FORCE_STDERR_TTY=1 \
+            F2E_FORCE_CI=1 F2E_FORCE_UNICODE=1 F2E_SHELL=bash \
+            TERM=xterm-256color COLUMNS=132 \
+            "$ZED" run "$PYTHON" "$GITHUB_WORKSPACE/zed_probe.py" > zed-ci.json
+          "$PYTHON" compare_context.py f2e-ci.jsonl zed-ci.json
+
+      - name: Compare rich non-CI terminal context
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            F2E="$GITHUB_WORKSPACE/f2e-probe.exe"
+            ZED="$GITHUB_WORKSPACE/zed/target/release/zed.exe"
+          else
+            F2E="$GITHUB_WORKSPACE/f2e-probe"
+            ZED="$GITHUB_WORKSPACE/zed/target/release/zed"
+          fi
+          PYTHON="$(command -v python3 || command -v python)"
+          env \
+            F2E_FORCE_STDIN_TTY=1 F2E_FORCE_STDOUT_TTY=1 F2E_FORCE_STDERR_TTY=1 \
+            F2E_FORCE_CI=0 F2E_FORCE_UNICODE=1 F2E_SHELL=/usr/bin/zsh \
+            TERM_PROGRAM=WezTerm TERM=xterm-256color COLUMNS=101 \
+            "$F2E" > f2e-tty.jsonl
+          env \
+            F2E_FORCE_STDIN_TTY=1 F2E_FORCE_STDOUT_TTY=1 F2E_FORCE_STDERR_TTY=1 \
+            F2E_FORCE_CI=0 F2E_FORCE_UNICODE=1 F2E_SHELL=/usr/bin/zsh \
+            TERM_PROGRAM=WezTerm TERM=xterm-256color COLUMNS=101 \
+            "$ZED" run "$PYTHON" "$GITHUB_WORKSPACE/zed_probe.py" > zed-tty.json
+          "$PYTHON" compare_context.py f2e-tty.jsonl zed-tty.json
+
+      - name: Compare inherited nested context
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            F2E="$GITHUB_WORKSPACE/f2e-probe.exe"
+            ZED="$GITHUB_WORKSPACE/zed/target/release/zed.exe"
+          else
+            F2E="$GITHUB_WORKSPACE/f2e-probe"
+            ZED="$GITHUB_WORKSPACE/zed/target/release/zed"
+          fi
+          PYTHON="$(command -v python3 || command -v python)"
+          common=(
+            -u F2E_SHELL -u ZED_PKG_SHELL -u SHELL -u COMSPEC
+            -u POWERSHELL_DISTRIBUTION_CHANNEL -u PSModulePath
+            F2E_FORCE_STDIN_TTY=1 F2E_FORCE_STDOUT_TTY=1 F2E_FORCE_STDERR_TTY=1
+            F2E_FORCE_CI=0 F2E_FORCE_UNICODE=0
+            F2E_CONTEXT_VERSION=1 F2E_CONTEXT_SHELL=fish
+            TERM=xterm-256color COLUMNS=88
+          )
+          env "${common[@]}" "$F2E" > f2e-nested.jsonl
+          env "${common[@]}" "$ZED" run "$PYTHON" "$GITHUB_WORKSPACE/zed_probe.py" > zed-nested.json
+          "$PYTHON" compare_context.py f2e-nested.jsonl zed-nested.json
+
+      - name: Prove both product checkouts stayed read-only
+        run: |
+          set -euo pipefail
+          git -C flags diff --exit-code
+          git -C flags diff --cached --exit-code
+          test -z "$(git -C flags ls-files --others --exclude-standard)"
+          git -C zed diff --exit-code
+          git -C zed diff --cached --exit-code
+          test -z "$(git -C zed ls-files --others --exclude-standard | grep -v '^target/' || true)"
+
+      - name: Enforce fixed-runner and credential-free policy
+        run: |
+          set -euo pipefail
+          workflow=fixture/.github/workflows/terminal-context-parity.yml
+          ! grep -Eq 'secrets\.|pull_request_target|persist-credentials:[[:space:]]*true|[a-z]+-latest' "$workflow"
+          grep -F 'contents: read' "$workflow"
+          grep -F 'ubuntu-24.04' "$workflow"
+          grep -F 'macos-15' "$workflow"
+          grep -F 'windows-2025' "$workflow"
+          grep -F "$FLAGS_REF" "$workflow"
+          grep -F "$ZED_REF" "$workflow"
