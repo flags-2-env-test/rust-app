@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ores-middleware-rust-${{ matrix.os }}-${{ github.ref }}
+  group: ores-middleware-rust-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
