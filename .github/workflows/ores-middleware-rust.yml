@@ -51,12 +51,28 @@ jobs:
           test "$(git -C middleware rev-parse HEAD)" = "$ORES_MIDDLEWARE_SHA"
           test -z "$(git -C middleware status --porcelain)"
 
-      - name: Format and compile every feature projection
+      - name: Classify Rust formatting drift without hiding semantic tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p middleware/target/test-org/rust
+          manifest=middleware/src/rust/Cargo.toml
+          set +e
+          cargo fmt --manifest-path "$manifest" -- --check > middleware/target/test-org/rust/rustfmt.txt 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "ORES_MIDDLEWARE_RUSTFMT_DRIFT=false" >> "$GITHUB_ENV"
+          else
+            echo "ORES_MIDDLEWARE_RUSTFMT_DRIFT=true" >> "$GITHUB_ENV"
+            echo "::warning file=middleware/src/rust::rustfmt 1.95 reports formatting drift; semantic clippy/tests will still run and promotion will fail at the final style gate"
+          fi
+
+      - name: Compile every Rust feature projection with Clippy
         shell: bash
         run: |
           set -euo pipefail
           manifest=middleware/src/rust/Cargo.toml
-          cargo fmt --manifest-path "$manifest" -- --check
           cargo clippy --manifest-path "$manifest" --no-default-features --all-targets -- -D warnings
           cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings
           cargo clippy --manifest-path "$manifest" --all-features --all-targets -- -D warnings
@@ -106,6 +122,15 @@ jobs:
             (.frameworkAdapters | index("axum")) != null
           '
 
+      - name: Retain Rust test-org evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flags-2-env-test-rust-middleware-${{ matrix.os }}-${{ github.run_id }}
+          path: middleware/target/test-org/rust
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Prove tracked upstream source stayed immutable
         if: ${{ always() }}
         shell: bash
@@ -113,3 +138,13 @@ jobs:
           set -euo pipefail
           test "$(git -C middleware rev-parse HEAD)" = "$ORES_MIDDLEWARE_SHA"
           test -z "$(git -C middleware diff --name-only)"
+
+      - name: Enforce Rust formatting reproducibility
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${ORES_MIDDLEWARE_RUSTFMT_DRIFT:-false}" = "true" ]; then
+            echo "::error file=middleware/src/rust::rustfmt 1.95 reports tracked-source formatting drift; upstream formatting must be normalized before promotion"
+            exit 1
+          fi
